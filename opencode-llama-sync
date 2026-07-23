@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Sincroniza os modelos expostos pelo llama.cpp com o arquivo de configuração
+# do OpenCode. O script não inicia o OpenCode após a atualização.
+#
+# Variáveis opcionais:
+#   LLAMA_BASE_URL=http://127.0.0.1:8085/v1
+#   OPENCODE_PROVIDER_ID=llamacpp-local
+#   OPENCODE_PROVIDER_NAME="llama.cpp local"
+#   OPENCODE_CONTEXT=32768
+#   OPENCODE_OUTPUT=4096
+#   OPENCODE_DEFAULT_MODEL=<id retornado por /v1/models>
+#   OPENCODE_CONFIG_FILE=$HOME/.config/opencode/opencode.json
+#
+# Dependências: curl e jq
+
+LLAMA_BASE_URL="${LLAMA_BASE_URL:-http://127.0.0.1:8085/v1}"
+PROVIDER_ID="${OPENCODE_PROVIDER_ID:-llamacpp-local}"
+PROVIDER_NAME="${OPENCODE_PROVIDER_NAME:-llama.cpp local}"
+CONTEXT_LIMIT="${OPENCODE_CONTEXT:-32768}"
+OUTPUT_LIMIT="${OPENCODE_OUTPUT:-4096}"
+CONFIG_FILE="${OPENCODE_CONFIG_FILE:-${HOME}/.config/opencode/opencode.json}"
+MODELS_URL="${LLAMA_BASE_URL%/}/models"
+BACKUP_FILE=""
+SUCCESS=0
+
+cleanup() {
+  rm -f "${tmp_existing:-}" "${tmp_generated:-}" "${CONFIG_FILE}.tmp"
+}
+
+finish() {
+  local exit_code=$?
+  cleanup
+
+  if (( SUCCESS == 1 && exit_code == 0 )); then
+    printf '\nConcluído: a configuração do OpenCode foi atualizada com sucesso.\n'
+    [[ -n "$BACKUP_FILE" ]] && printf 'Backup criado em: %s\n' "$BACKUP_FILE"
+    printf 'Arquivo atualizado: %s\n' "$CONFIG_FILE"
+  else
+    printf '\nFalha: o arquivo de configuração do OpenCode não foi atualizado.\n' >&2
+    [[ -n "$BACKUP_FILE" ]] && printf 'O backup permanece disponível em: %s\n' "$BACKUP_FILE" >&2
+  fi
+
+  exit "$exit_code"
+}
+
+trap finish EXIT
+
+for dependency in curl jq; do
+  if ! command -v "$dependency" >/dev/null 2>&1; then
+    printf 'Erro: dependência ausente: %s\n' "$dependency" >&2
+    exit 1
+  fi
+done
+
+if ! [[ "$CONTEXT_LIMIT" =~ ^[0-9]+$ ]] || (( CONTEXT_LIMIT < 1024 )); then
+  printf 'Erro: OPENCODE_CONTEXT deve ser um número inteiro válido.\n' >&2
+  exit 1
+fi
+
+if ! [[ "$OUTPUT_LIMIT" =~ ^[0-9]+$ ]] || (( OUTPUT_LIMIT < 1 )); then
+  printf 'Erro: OPENCODE_OUTPUT deve ser um número inteiro válido.\n' >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$CONFIG_FILE")"
+
+# Cria um backup com data e hora antes de consultar ou modificar a configuração.
+if [[ -f "$CONFIG_FILE" ]]; then
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  BACKUP_FILE="${CONFIG_FILE}.bak-${timestamp}"
+  cp -a -- "$CONFIG_FILE" "$BACKUP_FILE"
+  printf 'Backup criado: %s\n' "$BACKUP_FILE"
+else
+  printf 'Aviso: nenhum opencode.json existente foi encontrado para backup.\n'
+fi
+
+printf 'Consultando modelos em %s...\n' "$MODELS_URL"
+
+if ! models_response="$(curl --fail --silent --show-error \
+  --connect-timeout 5 \
+  --max-time 20 \
+  "$MODELS_URL")"; then
+  printf 'Erro: não foi possível consultar o llama.cpp em %s\n' "$MODELS_URL" >&2
+  exit 1
+fi
+
+if ! model_ids="$(jq -er '
+  [.data[]? | .id | select(type == "string" and length > 0)]
+  | unique
+  | if length == 0 then error("nenhum modelo encontrado") else . end
+' <<<"$models_response")"; then
+  printf 'Erro: o endpoint não retornou modelos válidos.\n' >&2
+  exit 1
+fi
+
+first_model="$(jq -r '.[0]' <<<"$model_ids")"
+default_model="${OPENCODE_DEFAULT_MODEL:-$first_model}"
+
+if ! jq -e --arg model "$default_model" 'index($model) != null' \
+  <<<"$model_ids" >/dev/null; then
+  printf 'Erro: OPENCODE_DEFAULT_MODEL="%s" não aparece em /v1/models.\n' \
+    "$default_model" >&2
+  exit 1
+fi
+
+tmp_existing="$(mktemp)"
+tmp_generated="$(mktemp)"
+
+if [[ -s "$CONFIG_FILE" ]]; then
+  if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+    printf 'Erro: o arquivo existente não contém JSON válido: %s\n' \
+      "$CONFIG_FILE" >&2
+    exit 1
+  fi
+  cp -- "$CONFIG_FILE" "$tmp_existing"
+else
+  printf '{}\n' >"$tmp_existing"
+fi
+
+jq -n \
+  --arg provider_id "$PROVIDER_ID" \
+  --arg provider_name "$PROVIDER_NAME" \
+  --arg base_url "$LLAMA_BASE_URL" \
+  --arg default_model "$default_model" \
+  --argjson context "$CONTEXT_LIMIT" \
+  --argjson output "$OUTPUT_LIMIT" \
+  --argjson model_ids "$model_ids" '
+  {
+    "$schema": "https://opencode.ai/config.json",
+    provider: {
+      ($provider_id): {
+        npm: "@ai-sdk/openai-compatible",
+        name: $provider_name,
+        options: {
+          baseURL: $base_url,
+          apiKey: "local"
+        },
+        models: (
+          reduce $model_ids[] as $id
+            ({};
+             .[$id] = {
+               name: $id,
+               limit: {
+                 context: $context,
+                 output: $output
+               }
+             })
+        )
+      }
+    },
+    model: ($provider_id + "/" + $default_model)
+  }
+' >"$tmp_generated"
+
+jq -s '
+  .[0] as $old
+  | .[1] as $new
+  | $old * {
+      "$schema": $new["$schema"],
+      provider: (($old.provider // {}) + $new.provider),
+      model: $new.model
+    }
+' "$tmp_existing" "$tmp_generated" >"${CONFIG_FILE}.tmp"
+
+# Valida o JSON final antes de substituir o arquivo atual.
+if ! jq empty "${CONFIG_FILE}.tmp" >/dev/null 2>&1; then
+  printf 'Erro: a configuração gerada não contém JSON válido.\n' >&2
+  exit 1
+fi
+
+mv -- "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
+
+printf '\nModelos sincronizados:\n'
+jq -r --arg provider "$PROVIDER_ID" \
+  '.[] | "  \($provider)/\(.)"' <<<"$model_ids"
+
+printf '\nModelo padrão: %s/%s\n' "$PROVIDER_ID" "$default_model"
+SUCCESS=1
