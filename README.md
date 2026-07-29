@@ -1,3 +1,5 @@
+# Este projeto utiliza a ferramenta Opencode para auxiliar no desenvolvimento de código. Trata-se de um projeto pessoal, disponibilizado publicamente sem intenção de uso comercial.
+
 # OpenCode LLama Sync
 
 Script para automação do cadastro de novos modelos do **llama-cpp** no **opencode.json**.
