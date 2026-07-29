@@ -1,4 +1,4 @@
-# Este projeto utiliza a ferramenta Opencode para auxiliar no desenvolvimento de código. Trata-se de um projeto pessoal, disponibilizado publicamente sem intenção de uso comercial.
+#### Aviso:Este projeto utiliza a ferramenta Opencode para auxiliar no desenvolvimento de código. Trata-se de um projeto pessoal, disponibilizado publicamente sem intenção de uso comercial.
 
 # OpenCode LLama Sync
 
